@@ -1,0 +1,17 @@
+{
+  "case_id": "CORR-DEMO-01",
+  "hop": {
+    "id": "H-7",
+    "waybill_id": "WB-1001",
+    "waybill_title": "华东干线样件",
+    "event_ts": "2026-11-17T21:05:00Z",
+    "location_code": "HZ-STATION",
+    "event_code": "EXCEPTION",
+    "seq": 5
+  },
+  "correction": {
+    "new_location_code": "HZ-STATION-3",
+    "new_event_code": "DELIVERED",
+    "reason": "现场回传：签收网点与事件码录错，实为 3 号站签收"
+  }
+}
