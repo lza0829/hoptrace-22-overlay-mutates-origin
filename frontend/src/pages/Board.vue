@@ -13,6 +13,7 @@ const form = ref({ new_location_code: '', new_event_code: '', reason: '' })
 const busy = ref(false)
 const opMsg = ref('')
 const opErr = ref('')
+const attestation = ref(null)
 
 async function loadList() {
   overview.value = await api.overview()
@@ -41,6 +42,7 @@ onMounted(async () => {
 
 watch(selected, (id) => {
   pickedHop.value = null
+  attestation.value = null
   opMsg.value = ''
   opErr.value = ''
   loadDetail(id).catch((e) => { err.value = String(e.message || e) })
@@ -59,6 +61,17 @@ function pick(h) {
   prefill(h)
   opMsg.value = ''
   opErr.value = ''
+  loadAttestation(h)
+}
+
+async function loadAttestation(h) {
+  attestation.value = null
+  if (!h?.overlay_id) return
+  try {
+    attestation.value = await api.correctionAttestation(h.overlay_id)
+  } catch (e) {
+    attestation.value = { torn: true, tear_reasons: [String(e.message || e)] }
+  }
 }
 
 async function refresh() {
@@ -81,6 +94,8 @@ async function applyCorrection() {
     const ev = p.events[p.events.length - 1]
     opMsg.value = `更正已生效 ${p.overlay_id} · 投影 ${ev.proj_before} → ${ev.proj_after}`
     await refresh()
+    const refreshed = (detail.value.hops || []).find((h) => h.id === pickedHop.value.id)
+    if (refreshed) await loadAttestation(refreshed)
   } catch (e) {
     opErr.value = String(e.message || e)
   } finally {
@@ -98,7 +113,11 @@ async function revokeCorrection() {
     const p = await api.revokeCorrection(selected.value, pickedHop.value.id, body)
     const ev = p.events[p.events.length - 1]
     opMsg.value = `已撤销 ${p.overlay_id} · 合成视图回到原点 · 投影 ${ev.proj_before} → ${ev.proj_after}`
+    const revokedId = pickedHop.value.id
     await refresh()
+    const refreshed = (detail.value.hops || []).find((h) => h.id === revokedId)
+    attestation.value = null
+    if (refreshed?.overlay_id) await loadAttestation(refreshed)
   } catch (e) {
     opErr.value = String(e.message || e)
   } finally {
@@ -119,6 +138,7 @@ async function revokeCorrection() {
       <div class="stat"><b>{{ overview.quarantine }}</b><span>隔离</span></div>
       <div class="stat"><b>{{ overview.overlays_effective }}</b><span>有效覆盖</span></div>
       <div class="stat"><b>{{ overview.correction_events }}</b><span>更正事件</span></div>
+      <div class="stat"><b>{{ overview.correction_attestations ?? 0 }}</b><span>撕裂核证</span></div>
     </div>
 
     <div class="tri">
@@ -209,6 +229,35 @@ async function revokeCorrection() {
           <p v-if="opErr" class="errmsg">{{ opErr }}</p>
         </div>
         <p v-else class="muted">点击竖轴上的 hop 节点，在此更正或撤销。</p>
+
+        <template v-if="attestation">
+          <h2>撕裂核证（只读）</h2>
+          <div class="attest" :class="attestation.torn ? 'torn' : 'intact'">
+            <div class="attest-state">
+              {{ attestation.torn ? '已撕裂' : '未撕裂' }} ·
+              覆盖{{ attestation.overlay_queryable ? '可查' : '不可查' }}
+            </div>
+            <dl class="kv">
+              <dt>事实点</dt><dd>{{ attestation.hop_id }}</dd>
+              <dt>覆盖</dt><dd>{{ attestation.overlay_id }}（{{ attestation.overlay_status }}）</dd>
+              <dt>指纹</dt><dd class="fp">{{ attestation.origin_fingerprint?.slice(0, 16) }}…</dd>
+              <dt>核证条数</dt><dd>{{ attestation.attestations.length }}</dd>
+              <dt>撤销事件</dt><dd>{{ attestation.revoke_events.length }}</dd>
+            </dl>
+            <ul v-if="attestation.tear_reasons.length" class="tear-list">
+              <li v-for="(reason, i) in attestation.tear_reasons" :key="i">{{ reason }}</li>
+            </ul>
+            <div
+              v-for="a in attestation.attestations"
+              :key="a.attestation_id"
+              class="attest-row"
+            >
+              <span class="tag" :class="a.action">{{ a.action === 'apply' ? '更正' : '撤销' }}</span>
+              <span>{{ a.composed.eff_event_code }}@{{ a.composed.eff_location_code }}</span>
+              <span class="muted">投影 {{ a.status_proj }}</span>
+            </div>
+          </div>
+        </template>
 
         <h2>状态证明</h2>
         <dl class="kv" v-if="proof">

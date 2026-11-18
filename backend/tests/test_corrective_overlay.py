@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from app import db, seed
 from app.main import app
+from app.modules import corrective_overlay as co
 
 FIXTURES = Path(__file__).resolve().parents[2] / "fixtures"
 
@@ -232,3 +233,252 @@ def test_ingest_after_correction_stays_consistent(client):
     h7 = next(h for h in detail["hops"] if h["id"] == "H-7")
     assert h7["corrected"] is True
     assert h7["eff_event_code"] == "DELIVERED"
+
+
+# ------------------------------------------------------------ 撕裂核证（基线所无）
+
+def test_attestation_bundle_links_origin_overlay_projection_and_revoke(client):
+    r = client.post(
+        "/api/waybills/WB-1001/hops/H-3/corrections",
+        json={"new_event_code": "DELIVERED", "reason": "事件码录错"},
+    )
+    overlay_id = r.json()["overlay_id"]
+
+    bundle = client.get(f"/api/corrections/{overlay_id}/attestation").json()
+    # 四要素齐：事实点 id、覆盖 id、合成投影、撤销事件（此时为空）
+    assert bundle["hop_id"] == "H-3"
+    assert bundle["overlay_id"] == overlay_id
+    assert bundle["overlay_status"] == "effective"
+    assert bundle["overlay_queryable"] is True
+    assert bundle["torn"] is False
+    assert bundle["tear_reasons"] == []
+    assert bundle["revoke_events"] == []
+    assert len(bundle["attestations"]) == 1
+    att = bundle["attestations"][0]
+    assert att["action"] == "apply"
+    assert att["hop_id"] == "H-3"
+    assert att["overlay_id"] == overlay_id
+    assert att["composed"]["eff_event_code"] == "DELIVERED"
+    assert att["composed"]["origin_event_code"] == "ARRIVED_HUB"
+    assert att["status_proj"] == "已签收"
+    assert att["origin_fingerprint"] == bundle["origin_fingerprint"]
+    # 投影与合成轴一致
+    assert bundle["consistency"]["consistent"] is True
+
+    # 撤销后核证包多一条 revoke 核证与撤销事件，合成投影回到原点语义
+    client.post(
+        "/api/waybills/WB-1001/hops/H-3/corrections/revoke",
+        json={"reason": "误操作撤销"},
+    )
+    bundle2 = client.get(f"/api/corrections/{overlay_id}/attestation").json()
+    assert bundle2["torn"] is False
+    assert bundle2["overlay_status"] == "revoked"
+    assert [a["action"] for a in bundle2["attestations"]] == ["apply", "revoke"]
+    assert len(bundle2["revoke_events"]) == 1
+    assert bundle2["attestations"][-1]["composed"]["eff_event_code"] == "ARRIVED_HUB"
+    assert bundle2["attestations"][-1]["status_proj"] == "到站"
+
+
+def test_attestation_list_endpoint_and_404(client):
+    assert client.get("/api/corrections/attestations").json() == []
+    r = client.post(
+        "/api/waybills/WB-1001/hops/H-2/corrections",
+        json={"new_location_code": "NJ-HUB-2", "reason": "站点录错"},
+    )
+    overlay_id = r.json()["overlay_id"]
+
+    rows = client.get("/api/corrections/attestations").json()
+    assert len(rows) == 1
+    assert rows[0]["overlay_id"] == overlay_id
+    assert rows[0]["hop_id"] == "H-2"
+
+    rows = client.get("/api/corrections/attestations?waybill_id=WB-1001").json()
+    assert len(rows) == 1
+    assert client.get("/api/corrections/attestations?waybill_id=WB-404").json() == []
+    assert client.get("/api/corrections/OV-NONE/attestation").status_code == 404
+
+
+# ------------------------------------------------------------ 事实点不可变（两路径）
+
+def test_origin_immutable_through_apply_and_revoke(client):
+    before = raw_hop("H-3")
+    client.post(
+        "/api/waybills/WB-1001/hops/H-3/corrections",
+        json={"new_event_code": "DELIVERED", "reason": "事件码录错"},
+    )
+    applied = raw_hop("H-3")
+    assert applied == before  # 提交更正后事实点字段不变
+
+    client.post(
+        "/api/waybills/WB-1001/hops/H-3/corrections/revoke",
+        json={"reason": "误操作撤销"},
+    )
+    revoked = raw_hop("H-3")
+    assert revoked == before  # 撤销后事实点字段仍不变，且事实点行从未被删除
+    assert revoked["event_code"] == "ARRIVED_HUB"
+
+    conn = db.connect()
+    try:
+        n = conn.execute("SELECT COUNT(*) c FROM hops WHERE id='H-3'").fetchone()["c"]
+        assert n == 1
+    finally:
+        conn.close()
+
+
+def test_db_triggers_block_in_place_mutation_and_delete(client):
+    # DB 层兜底：任何绕过覆盖层的事实点就地改/删都被触发器 ABORT
+    conn = db.connect()
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="不可就地修改"):
+            conn.execute("UPDATE hops SET event_code='DELIVERED' WHERE id='H-3'")
+        with pytest.raises(sqlite3.IntegrityError, match="不可删除"):
+            conn.execute("DELETE FROM hops WHERE id='H-3'")
+        conn.rollback()
+    finally:
+        conn.close()
+
+    # 触发器拒绝后事实点原样可读
+    assert raw_hop("H-3")["event_code"] == "ARRIVED_HUB"
+
+
+def test_attestation_write_failure_rolls_back_whole_correction(client):
+    # 失败闭：核证写入失败时事务必须整体回滚，不留无核证的覆盖。
+    ov0, ev0 = counts()
+    conn = db.connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        with pytest.raises(co.CorrectionError):
+            co._write_attestation(
+                conn, overlay_id="OV-GHOST", waybill_id="WB-1001", hop_id="H-404",
+                action="apply", event_id=None,
+                composed_hop={"id": "H-404"}, proj_value=None,
+            )
+        conn.rollback()
+    finally:
+        conn.close()
+    assert counts() == (ov0, ev0)
+
+    # 端到端：正常更正路径四件齐写（覆盖 + 投影证明 + 更正事件 + 撕裂核证），同成败。
+    r = client.post(
+        "/api/waybills/WB-1001/hops/H-2/corrections",
+        json={"new_location_code": "NJ-HUB-2", "reason": "站点录错"},
+    )
+    assert r.status_code == 200
+    overlay_id = r.json()["overlay_id"]
+    conn = db.connect()
+    try:
+        n_ov = conn.execute(
+            "SELECT COUNT(*) c FROM hop_overlays WHERE id=? AND status='effective'",
+            (overlay_id,),
+        ).fetchone()["c"]
+        n_ev = conn.execute(
+            "SELECT COUNT(*) c FROM correction_events WHERE overlay_id=?", (overlay_id,)
+        ).fetchone()["c"]
+        n_at = conn.execute(
+            "SELECT COUNT(*) c FROM correction_attestations WHERE overlay_id=?", (overlay_id,)
+        ).fetchone()["c"]
+    finally:
+        conn.close()
+    assert (n_ov, n_ev, n_at) == (1, 1, 1)
+
+
+# ------------------------------------------------------------ 撕裂检测（只读核证）
+
+def test_attestation_flags_torn_when_origin_silently_mutated(client):
+    client.post(
+        "/api/waybills/WB-1001/hops/H-3/corrections",
+        json={"new_event_code": "DELIVERED", "reason": "事件码录错"},
+    )
+    overlay_id = client.get("/api/corrections/attestations").json()[0]["overlay_id"]
+
+    # 模拟绕过应用的库内篡改：临时摘掉触发器、改事实点、恢复触发器。
+    conn = db.connect()
+    try:
+        conn.execute("DROP TRIGGER trg_hops_no_business_update")
+        conn.execute("UPDATE hops SET event_code='PICKED' WHERE id='H-3'")
+        conn.execute(
+            """
+            CREATE TRIGGER trg_hops_no_business_update
+            BEFORE UPDATE OF id, waybill_id, event_ts, location_code, event_code, seq, channel ON hops
+            BEGIN
+              SELECT RAISE(ABORT, '事实点业务字段不可就地修改：更正只能经覆盖层');
+            END
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    bundle = client.get(f"/api/corrections/{overlay_id}/attestation").json()
+    assert bundle["torn"] is True
+    assert any("指纹变化" in reason for reason in bundle["tear_reasons"])
+
+
+def test_attestation_flags_torn_when_origin_deleted(client):
+    client.post(
+        "/api/waybills/WB-1001/hops/H-2/corrections",
+        json={"new_location_code": "NJ-HUB-2", "reason": "站点录错"},
+    )
+    overlay_id = client.get("/api/corrections/attestations").json()[0]["overlay_id"]
+
+    conn = db.connect()
+    try:
+        # 模拟库级篡改：独立连接关闭外键与删除触发器后直接删事实点。
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("DROP TRIGGER trg_hops_no_delete")
+        conn.execute("DELETE FROM hops WHERE id='H-2'")
+        conn.commit()
+    finally:
+        conn.close()
+
+    bundle = client.get(f"/api/corrections/{overlay_id}/attestation").json()
+    assert bundle["torn"] is True
+    assert any("事实点已缺失" in reason for reason in bundle["tear_reasons"])
+
+
+# ------------------------------------------------------------ 本地夹具：两路径 + SQLite
+
+def test_fixture_covers_apply_and_revoke_with_origin_unchanged(client):
+    r = client.post("/api/corrections/run-fixture", json={"revoke": True})
+    assert r.status_code == 200, r.text
+    report = r.json()
+    assert report["ok"] is True
+    assert report["landed"] is True
+    assert report["corrected"] is True
+    assert report["revoked"] is True
+    assert report["origin_unchanged"] is True
+    assert report["origin_fingerprint"] == report["origin_fingerprint_after"]
+
+    # 撤销后合成视图回到事实点，投影回到错点语义（异常），原点字段始终是错点原值
+    detail = client.get("/api/waybills/WB-1001/timeline").json()
+    h7 = next(h for h in detail["hops"] if h["id"] == "H-7")
+    assert h7["corrected"] is False
+    assert (h7["event_code"], h7["location_code"]) == ("EXCEPTION", "HZ-STATION")
+    assert (h7["eff_event_code"], h7["eff_location_code"]) == ("EXCEPTION", "HZ-STATION")
+    assert detail["waybill"]["status_proj"] == "异常"
+
+    overlay_id = report["proof"]["overlay_id"]
+    bundle = client.get(f"/api/corrections/{overlay_id}/attestation").json()
+    assert [a["action"] for a in bundle["attestations"]] == ["apply", "revoke"]
+    assert len(bundle["revoke_events"]) == 1
+    assert bundle["torn"] is False
+
+    # 重跑撤销夹具幂等：不再落点、不再覆盖，撤销阶段跳过
+    again = client.post("/api/corrections/run-fixture", json={"revoke": True}).json()
+    assert again["landed"] is False
+    assert again["corrected"] is False
+    assert again["revoked"] is False
+    assert again["origin_unchanged"] is True
+    # 核证不重复追加
+    bundle2 = client.get(f"/api/corrections/{overlay_id}/attestation").json()
+    assert [a["action"] for a in bundle2["attestations"]] == ["apply", "revoke"]
+
+
+def test_overview_exposes_attestation_count(client):
+    ov = client.get("/api/overview").json()
+    assert ov["correction_attestations"] == 0
+    client.post(
+        "/api/waybills/WB-1001/hops/H-2/corrections",
+        json={"new_location_code": "NJ-HUB-2", "reason": "站点录错"},
+    )
+    assert client.get("/api/overview").json()["correction_attestations"] == 1

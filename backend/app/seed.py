@@ -81,6 +81,37 @@ CREATE TABLE IF NOT EXISTS correction_events (
   proj_after TEXT,
   created_at TEXT NOT NULL
 );
+
+-- 更正撕裂核证实体（基线所无）：事实点 id × 覆盖 id × 合成投影 × 撤销事件。
+-- 与覆盖写入、投影重算、更正事件同事务落库；只读接口重算原点指纹并比对，撕裂即报。
+CREATE TABLE IF NOT EXISTS correction_attestations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  attestation_id TEXT NOT NULL UNIQUE,
+  overlay_id TEXT NOT NULL REFERENCES hop_overlays(id),
+  waybill_id TEXT NOT NULL,
+  hop_id TEXT NOT NULL REFERENCES hops(id),
+  action TEXT NOT NULL,
+  event_id INTEGER,
+  status_proj TEXT NOT NULL,
+  composed_json TEXT NOT NULL,
+  origin_fingerprint TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+-- 事实点不可变硬约束的 DB 层兜底（失败闭）：
+-- DELETE 一律拒绝；业务字段就地 UPDATE 直接 ABORT，更正只能经 hop_overlays。
+-- retracted 为生命周期位，不在保护列内，允许隔离流程转位。
+CREATE TRIGGER IF NOT EXISTS trg_hops_no_delete
+BEFORE DELETE ON hops
+BEGIN
+  SELECT RAISE(ABORT, '事实点不可删除：更正只能经覆盖层');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_hops_no_business_update
+BEFORE UPDATE OF id, waybill_id, event_ts, location_code, event_code, seq, channel ON hops
+BEGIN
+  SELECT RAISE(ABORT, '事实点业务字段不可就地修改：更正只能经覆盖层');
+END;
 """
 
 EVENT_STATUS = {

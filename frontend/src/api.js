@@ -23,6 +23,14 @@ export const api = {
   corrections: (waybillId) =>
     req(waybillId ? `/api/waybills/${encodeURIComponent(waybillId)}/corrections` : '/api/corrections'),
   correctionProof: (overlayId) => req(`/api/corrections/${encodeURIComponent(overlayId)}`),
+  correctionAttestation: (overlayId) =>
+    req(`/api/corrections/${encodeURIComponent(overlayId)}/attestation`),
+  attestations: (waybillId) =>
+    req(
+      waybillId
+        ? `/api/corrections/attestations?waybill_id=${encodeURIComponent(waybillId)}`
+        : '/api/corrections/attestations',
+    ),
   applyCorrection: (waybillId, hopId, body) =>
     req(`/api/waybills/${encodeURIComponent(waybillId)}/hops/${encodeURIComponent(hopId)}/corrections`, {
       method: 'POST',
@@ -33,5 +41,6 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(body || {}),
     }),
-  runCorrectionFixture: () => req('/api/corrections/run-fixture', { method: 'POST' }),
+  runCorrectionFixture: (revoke = false) =>
+    req('/api/corrections/run-fixture', { method: 'POST', body: JSON.stringify({ revoke }) }),
 }

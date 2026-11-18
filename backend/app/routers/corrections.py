@@ -17,6 +17,10 @@ class RevokeIn(BaseModel):
     reason: str | None = None
 
 
+class FixtureIn(BaseModel):
+    revoke: bool = False
+
+
 def _guard(fn, *args):
     try:
         return fn(*args)
@@ -55,6 +59,16 @@ def all_corrections():
         conn.close()
 
 
+@router.get("/corrections/attestations")
+def attestations(waybill_id: str | None = None):
+    """撕裂核证明细只读接口（静态路径，须在 {overlay_id} 动态路由之前注册）。"""
+    conn = connect()
+    try:
+        return co.list_attestations(conn, waybill_id)
+    finally:
+        conn.close()
+
+
 @router.get("/corrections/{overlay_id}")
 def correction_proof(overlay_id: str):
     """更正证明只读接口：运单、目标 hop、覆盖前后、投影前后。"""
@@ -68,7 +82,20 @@ def correction_proof(overlay_id: str):
         conn.close()
 
 
+@router.get("/corrections/{overlay_id}/attestation")
+def correction_attestation(overlay_id: str):
+    """更正撕裂核证只读接口：事实点 id、覆盖 id、合成投影、撤销事件 + 即时撕裂判定。"""
+    conn = connect()
+    try:
+        bundle = co.get_attestation_bundle(conn, overlay_id)
+        if not bundle:
+            raise HTTPException(404, "核证实体不存在")
+        return bundle
+    finally:
+        conn.close()
+
+
 @router.post("/corrections/run-fixture")
-def run_correction_fixture():
-    """对照夹具：先落错点再更正。"""
-    return _guard(co.run_fixture)
+def run_correction_fixture(body: FixtureIn | None = None):
+    """对照夹具：先落错点再更正；body.revoke=true 时同事务再走撤销路径。"""
+    return _guard(co.run_fixture, bool(body and body.revoke))

@@ -27,6 +27,9 @@ def overview():
             "correction_events": conn.execute(
                 "SELECT COUNT(*) AS c FROM correction_events"
             ).fetchone()["c"],
+            "correction_attestations": conn.execute(
+                "SELECT COUNT(*) AS c FROM correction_attestations"
+            ).fetchone()["c"],
         }
     finally:
         conn.close()
